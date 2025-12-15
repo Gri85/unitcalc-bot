@@ -64,8 +64,10 @@ log = logging.getLogger("unitcalc-tma")
 
 USAGE: dict[int, dict[str, object]] = {}
 
+
 def _today_key() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
 
 def _check_and_inc(user_id: int) -> tuple[bool, int]:
     day = _today_key()
@@ -89,15 +91,18 @@ def make_keyboard() -> InlineKeyboardMarkup:
         [[InlineKeyboardButton("🧮 Открыть калькулятор", web_app=WebAppInfo(url=WEBAPP_URL))]]
     )
 
+
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     msg = update.effective_message
     if not msg:
         return
     await msg.reply_text(
         "Ок, открывай калькулятор кнопкой ниже 👇\n\n"
-        f"Бесплатно: {FREE_SENDS_PER_DAY} отправок/день.",
+        f"Бесплатно: {FREE_SENDS_PER_DAY} отправок/день.\n"
+        "Для диагностики: /whoami",
         reply_markup=make_keyboard(),
     )
+
 
 async def cmd_calc(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     msg = update.effective_message
@@ -105,11 +110,28 @@ async def cmd_calc(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
     await msg.reply_text("Лови калькулятор 👇", reply_markup=make_keyboard())
 
+
 async def cmd_pro(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     msg = update.effective_message
     if not msg:
         return
     await msg.reply_text("💳 Pro скоро будет. Пока напиши «хочу Pro».")
+
+
+async def cmd_whoami(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    msg = update.effective_message
+    user = update.effective_user
+    chat = update.effective_chat
+    if not msg or not user or not chat:
+        return
+    chat_type = getattr(chat, "type", "unknown")
+    await msg.reply_text(
+        f"🆔 whoami\n"
+        f"user_id: {user.id}\n"
+        f"chat_id: {chat.id}\n"
+        f"chat_type: {chat_type}"
+    )
+
 
 def _fmt_rub(x) -> str:
     try:
@@ -117,11 +139,13 @@ def _fmt_rub(x) -> str:
     except Exception:
         return "—"
 
+
 def _fmt_pct(x) -> str:
     try:
         return f"{float(x):.1f}".replace(".", ",")
     except Exception:
         return "—"
+
 
 async def on_webapp_data(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     msg = update.effective_message
@@ -139,7 +163,6 @@ async def on_webapp_data(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
              user_id, chat_id, chat_type, allowed, remaining)
 
     if not allowed:
-        # Шлём в чат, откуда пришло, и в личку (на всякий)
         text = (
             f"Лимит бесплатных отправок на сегодня исчерпан: {FREE_SENDS_PER_DAY}/{FREE_SENDS_PER_DAY}.\n"
             "Хочешь Pro — напиши /pro"
@@ -160,13 +183,19 @@ async def on_webapp_data(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         payload = json.loads(raw)
     except Exception:
         err = "Получил данные, но не смог распарсить. Попробуй ещё раз."
-        await context.bot.send_message(chat_id=chat_id, text=err)
+        try:
+            await context.bot.send_message(chat_id=chat_id, text=err)
+        except Exception:
+            pass
         if chat_id != user_id:
             try:
                 await context.bot.send_message(chat_id=user_id, text=err)
             except Exception:
                 pass
         return
+
+    # полезно для диагностики iOS/web
+    log.info("payload meta: platform=%s ts=%s", payload.get("platform"), payload.get("ts"))
 
     profit = payload.get("profit")
     margin = payload.get("margin")
@@ -190,14 +219,12 @@ async def on_webapp_data(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         f"Осталось бесплатных отправок сегодня: {remaining}"
     )
 
-    # 1) Отвечаем туда, откуда пришло
     try:
         m1 = await context.bot.send_message(chat_id=chat_id, text=report)
         log.info("sent report to chat_id=%s message_id=%s", chat_id, getattr(m1, "message_id", None))
     except Exception as e:
         log.exception("send report to chat failed: %s", e)
 
-    # 2) И ДУБЛИРУЕМ В ЛИЧКУ, если это не личка
     if chat_id != user_id:
         try:
             m2 = await context.bot.send_message(chat_id=user_id, text=report)
@@ -209,22 +236,28 @@ async def on_webapp_data(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     log.exception("PTB error: %s", context.error)
 
+
 def build_telegram_app() -> Application:
     app = Application.builder().token(BOT_TOKEN).updater(None).build()
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("calc", cmd_calc))
     app.add_handler(CommandHandler("pro", cmd_pro))
+    app.add_handler(CommandHandler("whoami", cmd_whoami))
     app.add_handler(MessageHandler(filters.StatusUpdate.WEB_APP_DATA, on_webapp_data))
     app.add_error_handler(on_error)
     return app
 
+
 telegram_app = build_telegram_app()
+
 
 async def homepage(_: Request) -> PlainTextResponse:
     return PlainTextResponse("OK")
 
+
 async def health(_: Request) -> PlainTextResponse:
     return PlainTextResponse("OK")
+
 
 async def telegram_webhook(request: Request) -> Response:
     if request.method != "POST":
@@ -249,6 +282,7 @@ async def telegram_webhook(request: Request) -> Response:
 
     return Response(status_code=200)
 
+
 async def on_startup() -> None:
     await telegram_app.initialize()
     await telegram_app.start()
@@ -267,9 +301,11 @@ async def on_startup() -> None:
         allowed_updates=Update.ALL_TYPES,
     )
 
+
 async def on_shutdown() -> None:
     await telegram_app.stop()
     await telegram_app.shutdown()
+
 
 routes = [
     Route("/", endpoint=homepage, methods=["GET"]),
