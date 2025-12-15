@@ -16,10 +16,8 @@ from telegram.ext import (
     filters,
 )
 
-# --- optional .env for local dev ---
 try:
     from dotenv import load_dotenv
-
     load_dotenv()
 except Exception:
     pass
@@ -31,41 +29,43 @@ logging.basicConfig(
 log = logging.getLogger("unitcalc-tma")
 
 BOT_TOKEN = (os.getenv("BOT_TOKEN") or "").strip()
-WEBAPP_URL = (os.getenv("WEBAPP_URL") or "").strip()  # e.g. https://gri85.github.io/unitcalc-tma/
-WEBHOOK_SECRET = (os.getenv("WEBHOOK_SECRET") or "").strip()  # any random string
+WEBAPP_URL = (os.getenv("WEBAPP_URL") or "").strip()
+WEBHOOK_SECRET = (os.getenv("WEBHOOK_SECRET") or "").strip()
 BASE_URL = ((os.getenv("PUBLIC_BASE_URL") or os.getenv("RENDER_EXTERNAL_URL") or "").strip()).rstrip("/")
 
 if not BOT_TOKEN:
-    raise RuntimeError("BOT_TOKEN is empty. Set it as environment variable (Render) or in .env (local).")
+    raise RuntimeError("BOT_TOKEN is empty.")
 if not WEBAPP_URL:
-    raise RuntimeError("WEBAPP_URL is empty. Set it as environment variable (Render) or in .env (local).")
-
+    raise RuntimeError("WEBAPP_URL is empty.")
 
 def make_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         [[InlineKeyboardButton("🧮 Открыть калькулятор", web_app=WebAppInfo(url=WEBAPP_URL))]]
     )
 
-
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     msg = update.effective_message
     if not msg:
         return
-    await msg.reply_text(
-        "Ок, открывай калькулятор кнопкой ниже 👇",
-        reply_markup=make_keyboard(),
-    )
-
+    await msg.reply_text("Ок, открывай калькулятор кнопкой ниже 👇", reply_markup=make_keyboard())
 
 async def cmd_calc(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     msg = update.effective_message
     if not msg:
         return
-    await msg.reply_text(
-        "Лови калькулятор 👇",
-        reply_markup=make_keyboard(),
-    )
+    await msg.reply_text("Лови калькулятор 👇", reply_markup=make_keyboard())
 
+def _fmt_rub(x) -> str:
+    try:
+        return f"{int(round(float(x))):,}".replace(",", " ")
+    except Exception:
+        return "—"
+
+def _fmt_pct(x) -> str:
+    try:
+        return f"{float(x):.1f}".replace(".", ",")
+    except Exception:
+        return "—"
 
 async def on_webapp_data(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     msg = update.effective_message
@@ -73,15 +73,27 @@ async def on_webapp_data(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         return
 
     raw = msg.web_app_data.data or ""
-    payload = None
     try:
         payload = json.loads(raw)
     except Exception:
-        payload = {"raw": raw}
+        await msg.reply_text("Получил данные, но не смог распарсить. Попробуй ещё раз.")
+        return
 
-    # Здесь позже сделаем красивый разбор юнит-экономики.
-    await msg.reply_text(f"✅ Данные получены:\n{json.dumps(payload, ensure_ascii=False, indent=2)}")
+    profit = payload.get("profit")
+    margin = payload.get("margin")
+    ad_max = payload.get("adMax")
+    p_be = payload.get("pBe")
 
+    status = "✅ В плюсе" if (profit is not None and float(profit) > 0) else ("⚠️ В ноль" if profit == 0 else "❌ В минус")
+    text = (
+        f"📌 Юнит-экономика\n"
+        f"{status}\n\n"
+        f"• Прибыль: {_fmt_rub(profit)} ₽\n"
+        f"• Маржа: {_fmt_pct(margin)} %\n"
+        f"• Max CPO: {_fmt_rub(ad_max)} ₽\n"
+        f"• Цена безубыточности: {_fmt_rub(p_be)} ₽"
+    )
+    await msg.reply_text(text)
 
 def build_telegram_app() -> Application:
     app = Application.builder().token(BOT_TOKEN).updater(None).build()
@@ -90,17 +102,13 @@ def build_telegram_app() -> Application:
     app.add_handler(MessageHandler(filters.StatusUpdate.WEB_APP_DATA, on_webapp_data))
     return app
 
-
 telegram_app = build_telegram_app()
-
 
 async def homepage(_: Request) -> PlainTextResponse:
     return PlainTextResponse("OK")
 
-
 async def health(_: Request) -> PlainTextResponse:
     return PlainTextResponse("OK")
-
 
 async def telegram_webhook(request: Request) -> Response:
     if request.method != "POST":
@@ -125,15 +133,12 @@ async def telegram_webhook(request: Request) -> Response:
 
     return Response(status_code=200)
 
-
 async def on_startup() -> None:
     await telegram_app.initialize()
     await telegram_app.start()
 
-    # На Render BASE_URL обычно берётся из RENDER_EXTERNAL_URL
     if not BASE_URL:
         log.warning("BASE_URL is empty. Webhook will NOT be set automatically.")
-        log.warning("Set PUBLIC_BASE_URL (or rely on RENDER_EXTERNAL_URL on Render).")
         return
 
     webhook_url = f"{BASE_URL}/telegram/webhook"
@@ -146,16 +151,13 @@ async def on_startup() -> None:
         allowed_updates=Update.ALL_TYPES,
     )
 
-
 async def on_shutdown() -> None:
     try:
         await telegram_app.bot.delete_webhook(drop_pending_updates=True)
     except Exception:
         pass
-
     await telegram_app.stop()
     await telegram_app.shutdown()
-
 
 routes = [
     Route("/", endpoint=homepage, methods=["GET"]),
@@ -165,9 +167,7 @@ routes = [
 
 app = Starlette(routes=routes, on_startup=[on_startup], on_shutdown=[on_shutdown])
 
-
 if __name__ == "__main__":
     import uvicorn
-
     port = int(os.getenv("PORT", "8000"))
     uvicorn.run("main:app", host="0.0.0.0", port=port, reload=True)
