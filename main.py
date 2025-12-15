@@ -1,6 +1,7 @@
 import os
 import json
 import logging
+from datetime import datetime, timezone
 
 from starlette.applications import Starlette
 from starlette.requests import Request
@@ -27,6 +28,9 @@ BOT_TOKEN = (os.getenv("BOT_TOKEN") or "").strip()
 WEBAPP_URL = (os.getenv("WEBAPP_URL") or "").strip()
 WEBHOOK_SECRET = (os.getenv("WEBHOOK_SECRET") or "").strip()
 BASE_URL = ((os.getenv("PUBLIC_BASE_URL") or os.getenv("RENDER_EXTERNAL_URL") or "").strip()).rstrip("/")
+
+# лимит бесплатных "Отправить в чат" в сутки
+FREE_SENDS_PER_DAY = int(os.getenv("FREE_SENDS_PER_DAY", "5"))
 
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN is empty.")
@@ -55,14 +59,39 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
 )
-
-# ВАЖНО: на Render httpx может логировать URL с токеном — глушим и + редактируем всё
 logging.getLogger("httpx").setLevel(logging.WARNING)
-
-root_logger = logging.getLogger()
-root_logger.addFilter(RedactFilter([BOT_TOKEN, WEBHOOK_SECRET]))
-
+logging.getLogger().addFilter(RedactFilter([BOT_TOKEN, WEBHOOK_SECRET]))
 log = logging.getLogger("unitcalc-tma")
+
+
+# --- очень простой лимитер в памяти процесса ---
+# ключ: user_id -> {"day":"YYYY-MM-DD", "count":int}
+USAGE: dict[int, dict[str, object]] = {}
+
+
+def _today_key() -> str:
+    # UTC достаточно; если захочешь — потом сделаем по Europe/Amsterdam
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+
+def _check_and_inc(user_id: int) -> tuple[bool, int]:
+    """
+    returns: (allowed, remaining)
+    """
+    day = _today_key()
+    rec = USAGE.get(user_id)
+    if not rec or rec.get("day") != day:
+        rec = {"day": day, "count": 0}
+        USAGE[user_id] = rec
+
+    count = int(rec.get("count", 0))
+    if count >= FREE_SENDS_PER_DAY:
+        return (False, 0)
+
+    count += 1
+    rec["count"] = count
+    remaining = max(0, FREE_SENDS_PER_DAY - count)
+    return (True, remaining)
 
 
 def make_keyboard() -> InlineKeyboardMarkup:
@@ -76,7 +105,8 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not msg:
         return
     await msg.reply_text(
-        "Ок, открывай калькулятор кнопкой ниже 👇",
+        "Ок, открывай калькулятор кнопкой ниже 👇\n\n"
+        f"Бесплатно: {FREE_SENDS_PER_DAY} отправок/день.",
         reply_markup=make_keyboard(),
     )
 
@@ -85,9 +115,17 @@ async def cmd_calc(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     msg = update.effective_message
     if not msg:
         return
+    await msg.reply_text("Лови калькулятор 👇", reply_markup=make_keyboard())
+
+
+async def cmd_pro(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    msg = update.effective_message
+    if not msg:
+        return
     await msg.reply_text(
-        "Лови калькулятор 👇",
-        reply_markup=make_keyboard(),
+        "💳 Pro скоро будет.\n\n"
+        "Идея: Pro снимет лимит и добавит экспорт/сохранение проектов.\n"
+        "Пока просто напиши мне «хочу Pro» — я добавлю тебя в список."
     )
 
 
@@ -107,7 +145,17 @@ def _fmt_pct(x) -> str:
 
 async def on_webapp_data(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     msg = update.effective_message
-    if not msg or not msg.web_app_data:
+    if not msg or not msg.web_app_data or not update.effective_user:
+        return
+
+    user_id = update.effective_user.id
+    allowed, remaining = _check_and_inc(user_id)
+
+    if not allowed:
+        await msg.reply_text(
+            f"Лимит бесплатных отправок на сегодня исчерпан: {FREE_SENDS_PER_DAY}/{FREE_SENDS_PER_DAY}.\n"
+            "Хочешь Pro — напиши /pro"
+        )
         return
 
     raw = msg.web_app_data.data or ""
@@ -135,7 +183,8 @@ async def on_webapp_data(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         f"• Прибыль: {_fmt_rub(profit)} ₽\n"
         f"• Маржа: {_fmt_pct(margin)} %\n"
         f"• Max CPO: {_fmt_rub(ad_max)} ₽\n"
-        f"• Цена безубыточности: {_fmt_rub(p_be)} ₽"
+        f"• Цена безубыточности: {_fmt_rub(p_be)} ₽\n\n"
+        f"Осталось бесплатных отправок сегодня: {remaining}"
     )
     await msg.reply_text(text)
 
@@ -144,6 +193,7 @@ def build_telegram_app() -> Application:
     app = Application.builder().token(BOT_TOKEN).updater(None).build()
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("calc", cmd_calc))
+    app.add_handler(CommandHandler("pro", cmd_pro))
     app.add_handler(MessageHandler(filters.StatusUpdate.WEB_APP_DATA, on_webapp_data))
     return app
 
@@ -203,7 +253,6 @@ async def on_startup() -> None:
 
 
 async def on_shutdown() -> None:
-    # НЕ удаляем webhook на shutdown (Render может рестартить процесс)
     await telegram_app.stop()
     await telegram_app.shutdown()
 
