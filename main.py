@@ -17,7 +17,6 @@ from telegram.ext import (
     filters,
 )
 
-# --- optional .env for local dev ---
 try:
     from dotenv import load_dotenv
     load_dotenv()
@@ -58,19 +57,15 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
 )
-# чтобы токен не светился в логах httpx
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger().addFilter(RedactFilter([BOT_TOKEN, WEBHOOK_SECRET]))
 
 log = logging.getLogger("unitcalc-tma")
 
-# --- лимитер в памяти процесса ---
 USAGE: dict[int, dict[str, object]] = {}
-
 
 def _today_key() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%d")
-
 
 def _check_and_inc(user_id: int) -> tuple[bool, int]:
     day = _today_key()
@@ -94,7 +89,6 @@ def make_keyboard() -> InlineKeyboardMarkup:
         [[InlineKeyboardButton("🧮 Открыть калькулятор", web_app=WebAppInfo(url=WEBAPP_URL))]]
     )
 
-
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     msg = update.effective_message
     if not msg:
@@ -105,24 +99,17 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         reply_markup=make_keyboard(),
     )
 
-
 async def cmd_calc(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     msg = update.effective_message
     if not msg:
         return
     await msg.reply_text("Лови калькулятор 👇", reply_markup=make_keyboard())
 
-
 async def cmd_pro(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     msg = update.effective_message
     if not msg:
         return
-    await msg.reply_text(
-        "💳 Pro скоро будет.\n\n"
-        "Pro снимет лимит и добавит сохранение/экспорт.\n"
-        "Пока просто напиши «хочу Pro»."
-    )
-
+    await msg.reply_text("💳 Pro скоро будет. Пока напиши «хочу Pro».")
 
 def _fmt_rub(x) -> str:
     try:
@@ -130,39 +117,55 @@ def _fmt_rub(x) -> str:
     except Exception:
         return "—"
 
-
 def _fmt_pct(x) -> str:
     try:
         return f"{float(x):.1f}".replace(".", ",")
     except Exception:
         return "—"
 
-
 async def on_webapp_data(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     msg = update.effective_message
     user = update.effective_user
-    if not msg or not msg.web_app_data or not user:
+    chat = update.effective_chat
+    if not msg or not msg.web_app_data or not user or not chat:
         return
 
     user_id = user.id
-    allowed, remaining = _check_and_inc(user_id)
+    chat_id = chat.id
+    chat_type = getattr(chat, "type", "unknown")
 
-    log.info("web_app_data received: user_id=%s allowed=%s remaining=%s", user_id, allowed, remaining)
+    allowed, remaining = _check_and_inc(user_id)
+    log.info("web_app_data: user_id=%s chat_id=%s chat_type=%s allowed=%s remaining=%s",
+             user_id, chat_id, chat_type, allowed, remaining)
 
     if not allowed:
-        await msg.reply_text(
+        # Шлём в чат, откуда пришло, и в личку (на всякий)
+        text = (
             f"Лимит бесплатных отправок на сегодня исчерпан: {FREE_SENDS_PER_DAY}/{FREE_SENDS_PER_DAY}.\n"
             "Хочешь Pro — напиши /pro"
         )
-        log.info("limit message sent to user_id=%s", user_id)
+        try:
+            await context.bot.send_message(chat_id=chat_id, text=text)
+        except Exception as e:
+            log.exception("send limit to chat failed: %s", e)
+        if chat_id != user_id:
+            try:
+                await context.bot.send_message(chat_id=user_id, text=text)
+            except Exception as e:
+                log.exception("send limit to dm failed: %s", e)
         return
 
     raw = msg.web_app_data.data or ""
     try:
         payload = json.loads(raw)
     except Exception:
-        await msg.reply_text("Получил данные, но не смог распарсить. Попробуй ещё раз.")
-        log.info("json parse failed for user_id=%s", user_id)
+        err = "Получил данные, но не смог распарсить. Попробуй ещё раз."
+        await context.bot.send_message(chat_id=chat_id, text=err)
+        if chat_id != user_id:
+            try:
+                await context.bot.send_message(chat_id=user_id, text=err)
+            except Exception:
+                pass
         return
 
     profit = payload.get("profit")
@@ -177,7 +180,7 @@ async def on_webapp_data(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     status = "✅ В плюсе" if (p is not None and p > 0) else ("⚠️ В ноль" if p == 0 else "❌ В минус")
 
-    text = (
+    report = (
         f"📌 Юнит-экономика\n"
         f"{status}\n\n"
         f"• Прибыль: {_fmt_rub(profit)} ₽\n"
@@ -186,13 +189,25 @@ async def on_webapp_data(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         f"• Цена безубыточности: {_fmt_rub(p_be)} ₽\n\n"
         f"Осталось бесплатных отправок сегодня: {remaining}"
     )
-    await msg.reply_text(text)
-    log.info("report sent to user_id=%s", user_id)
+
+    # 1) Отвечаем туда, откуда пришло
+    try:
+        m1 = await context.bot.send_message(chat_id=chat_id, text=report)
+        log.info("sent report to chat_id=%s message_id=%s", chat_id, getattr(m1, "message_id", None))
+    except Exception as e:
+        log.exception("send report to chat failed: %s", e)
+
+    # 2) И ДУБЛИРУЕМ В ЛИЧКУ, если это не личка
+    if chat_id != user_id:
+        try:
+            m2 = await context.bot.send_message(chat_id=user_id, text=report)
+            log.info("sent report to dm user_id=%s message_id=%s", user_id, getattr(m2, "message_id", None))
+        except Exception as e:
+            log.exception("send report to dm failed: %s", e)
 
 
 async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
-    log.exception("PTB error handler caught exception: %s", context.error)
-
+    log.exception("PTB error: %s", context.error)
 
 def build_telegram_app() -> Application:
     app = Application.builder().token(BOT_TOKEN).updater(None).build()
@@ -203,17 +218,13 @@ def build_telegram_app() -> Application:
     app.add_error_handler(on_error)
     return app
 
-
 telegram_app = build_telegram_app()
-
 
 async def homepage(_: Request) -> PlainTextResponse:
     return PlainTextResponse("OK")
 
-
 async def health(_: Request) -> PlainTextResponse:
     return PlainTextResponse("OK")
-
 
 async def telegram_webhook(request: Request) -> Response:
     if request.method != "POST":
@@ -231,17 +242,12 @@ async def telegram_webhook(request: Request) -> Response:
 
     try:
         update = Update.de_json(data, telegram_app.bot)
-
-        # ВАЖНО: обрабатываем апдейт сразу (не через очередь),
-        # чтобы точно отрабатывало на мобилке.
         await telegram_app.process_update(update)
-
     except Exception as e:
-        log.exception("Failed to process update: %s", e)
+        log.exception("process_update failed: %s", e)
         return PlainTextResponse("Error", status_code=500)
 
     return Response(status_code=200)
-
 
 async def on_startup() -> None:
     await telegram_app.initialize()
@@ -261,12 +267,9 @@ async def on_startup() -> None:
         allowed_updates=Update.ALL_TYPES,
     )
 
-
 async def on_shutdown() -> None:
-    # НЕ удаляем webhook на shutdown (Render может рестартить процесс)
     await telegram_app.stop()
     await telegram_app.shutdown()
-
 
 routes = [
     Route("/", endpoint=homepage, methods=["GET"]),
