@@ -29,7 +29,6 @@ WEBAPP_URL = (os.getenv("WEBAPP_URL") or "").strip()
 WEBHOOK_SECRET = (os.getenv("WEBHOOK_SECRET") or "").strip()
 BASE_URL = ((os.getenv("PUBLIC_BASE_URL") or os.getenv("RENDER_EXTERNAL_URL") or "").strip()).rstrip("/")
 
-# лимит бесплатных "Отправить в чат" в сутки
 FREE_SENDS_PER_DAY = int(os.getenv("FREE_SENDS_PER_DAY", "5"))
 
 if not BOT_TOKEN:
@@ -59,25 +58,21 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
 )
+# чтобы токен не светился в логах httpx
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger().addFilter(RedactFilter([BOT_TOKEN, WEBHOOK_SECRET]))
+
 log = logging.getLogger("unitcalc-tma")
 
-
-# --- очень простой лимитер в памяти процесса ---
-# ключ: user_id -> {"day":"YYYY-MM-DD", "count":int}
+# --- лимитер в памяти процесса ---
 USAGE: dict[int, dict[str, object]] = {}
 
 
 def _today_key() -> str:
-    # UTC достаточно; если захочешь — потом сделаем по Europe/Amsterdam
     return datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
 
 def _check_and_inc(user_id: int) -> tuple[bool, int]:
-    """
-    returns: (allowed, remaining)
-    """
     day = _today_key()
     rec = USAGE.get(user_id)
     if not rec or rec.get("day") != day:
@@ -124,8 +119,8 @@ async def cmd_pro(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
     await msg.reply_text(
         "💳 Pro скоро будет.\n\n"
-        "Идея: Pro снимет лимит и добавит экспорт/сохранение проектов.\n"
-        "Пока просто напиши мне «хочу Pro» — я добавлю тебя в список."
+        "Pro снимет лимит и добавит сохранение/экспорт.\n"
+        "Пока просто напиши «хочу Pro»."
     )
 
 
@@ -145,17 +140,21 @@ def _fmt_pct(x) -> str:
 
 async def on_webapp_data(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     msg = update.effective_message
-    if not msg or not msg.web_app_data or not update.effective_user:
+    user = update.effective_user
+    if not msg or not msg.web_app_data or not user:
         return
 
-    user_id = update.effective_user.id
+    user_id = user.id
     allowed, remaining = _check_and_inc(user_id)
+
+    log.info("web_app_data received: user_id=%s allowed=%s remaining=%s", user_id, allowed, remaining)
 
     if not allowed:
         await msg.reply_text(
             f"Лимит бесплатных отправок на сегодня исчерпан: {FREE_SENDS_PER_DAY}/{FREE_SENDS_PER_DAY}.\n"
             "Хочешь Pro — напиши /pro"
         )
+        log.info("limit message sent to user_id=%s", user_id)
         return
 
     raw = msg.web_app_data.data or ""
@@ -163,6 +162,7 @@ async def on_webapp_data(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         payload = json.loads(raw)
     except Exception:
         await msg.reply_text("Получил данные, но не смог распарсить. Попробуй ещё раз.")
+        log.info("json parse failed for user_id=%s", user_id)
         return
 
     profit = payload.get("profit")
@@ -187,6 +187,11 @@ async def on_webapp_data(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         f"Осталось бесплатных отправок сегодня: {remaining}"
     )
     await msg.reply_text(text)
+    log.info("report sent to user_id=%s", user_id)
+
+
+async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    log.exception("PTB error handler caught exception: %s", context.error)
 
 
 def build_telegram_app() -> Application:
@@ -195,6 +200,7 @@ def build_telegram_app() -> Application:
     app.add_handler(CommandHandler("calc", cmd_calc))
     app.add_handler(CommandHandler("pro", cmd_pro))
     app.add_handler(MessageHandler(filters.StatusUpdate.WEB_APP_DATA, on_webapp_data))
+    app.add_error_handler(on_error)
     return app
 
 
@@ -225,9 +231,13 @@ async def telegram_webhook(request: Request) -> Response:
 
     try:
         update = Update.de_json(data, telegram_app.bot)
-        await telegram_app.update_queue.put(update)
+
+        # ВАЖНО: обрабатываем апдейт сразу (не через очередь),
+        # чтобы точно отрабатывало на мобилке.
+        await telegram_app.process_update(update)
+
     except Exception as e:
-        log.exception("Failed to enqueue update: %s", e)
+        log.exception("Failed to process update: %s", e)
         return PlainTextResponse("Error", status_code=500)
 
     return Response(status_code=200)
@@ -253,6 +263,7 @@ async def on_startup() -> None:
 
 
 async def on_shutdown() -> None:
+    # НЕ удаляем webhook на shutdown (Render может рестартить процесс)
     await telegram_app.stop()
     await telegram_app.shutdown()
 
