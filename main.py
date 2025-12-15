@@ -23,16 +23,6 @@ try:
 except Exception:
     pass
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
-)
-
-# ВАЖНО: чтобы токен не светился в Render логах
-logging.getLogger("httpx").setLevel(logging.WARNING)
-
-log = logging.getLogger("unitcalc-tma")
-
 BOT_TOKEN = (os.getenv("BOT_TOKEN") or "").strip()
 WEBAPP_URL = (os.getenv("WEBAPP_URL") or "").strip()
 WEBHOOK_SECRET = (os.getenv("WEBHOOK_SECRET") or "").strip()
@@ -42,6 +32,37 @@ if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN is empty.")
 if not WEBAPP_URL:
     raise RuntimeError("WEBAPP_URL is empty.")
+
+
+class RedactFilter(logging.Filter):
+    def __init__(self, secrets: list[str]):
+        super().__init__()
+        self.secrets = [s for s in secrets if s]
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        try:
+            msg = record.getMessage()
+            for s in self.secrets:
+                msg = msg.replace(s, "<REDACTED>")
+            record.msg = msg
+            record.args = ()
+        except Exception:
+            pass
+        return True
+
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+)
+
+# ВАЖНО: на Render httpx может логировать URL с токеном — глушим и + редактируем всё
+logging.getLogger("httpx").setLevel(logging.WARNING)
+
+root_logger = logging.getLogger()
+root_logger.addFilter(RedactFilter([BOT_TOKEN, WEBHOOK_SECRET]))
+
+log = logging.getLogger("unitcalc-tma")
 
 
 def make_keyboard() -> InlineKeyboardMarkup:
@@ -182,8 +203,7 @@ async def on_startup() -> None:
 
 
 async def on_shutdown() -> None:
-    # ВАЖНО: НЕ удаляем webhook на shutdown!
-    # Render может стопать/рестартить процесс — если удалить webhook, бот “умрёт”.
+    # НЕ удаляем webhook на shutdown (Render может рестартить процесс)
     await telegram_app.stop()
     await telegram_app.shutdown()
 
